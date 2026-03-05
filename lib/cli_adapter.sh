@@ -72,7 +72,14 @@ _cli_adapter_is_valid_cli() {
 get_cli_type() {
     local agent_id="$1"
     if [[ -z "$agent_id" ]]; then
-        echo "claude"
+        # 空の場合は cli.default を参照（未設定なら claude）
+        local default_cli
+        default_cli=$(_cli_adapter_read_yaml "cli.default" "claude")
+        if _cli_adapter_is_valid_cli "$default_cli"; then
+            echo "$default_cli"
+        else
+            echo "claude"
+        fi
         return 0
     fi
 
@@ -152,13 +159,15 @@ build_cli_command() {
         codex)
             local cmd="codex"
             if [[ -n "$model" ]]; then
-                cmd="$cmd --model $model"
+                local full_model
+                full_model=$(_resolve_full_model_name "$model" "codex")
+                cmd="$cmd --model $full_model"
             fi
             cmd="$cmd --search --dangerously-bypass-approvals-and-sandbox --no-alt-screen"
             echo "$cmd"
             ;;
         copilot)
-            echo "copilot --yolo"
+            echo "copilot --yolo --autopilot"
             ;;
         kimi)
             local cmd="kimi --yolo"
@@ -238,8 +247,30 @@ validate_cli_availability() {
     return 0
 }
 
+# _resolve_full_model_name(short_model, cli_type)
+# 短縮モデル名をCLI種別に応じたフルモデル名に変換する
+# 既にフルモデル名の場合はそのまま返す
+_resolve_full_model_name() {
+    local model="$1"
+    local cli_type="$2"
+
+    # 既にフル名（ハイフン含む）ならそのまま返す
+    if [[ "$model" == *-* ]]; then
+        echo "$model"
+        return 0
+    fi
+
+    # 短縮名→フルモデル名マッピング（フルモデル名やOpenAI系はそのまま通す）
+    case "$model" in
+        opus)   echo "claude-opus-4.6" ;;
+        sonnet) echo "claude-sonnet-4.6" ;;
+        haiku)  echo "claude-haiku-4.5" ;;
+        *)      echo "$model" ;;  # フルモデル名（gpt-5.3-codex等）はそのまま
+    esac
+}
+
 # get_agent_model(agent_id)
-# エージェントが使用すべきモデル名を返す
+# エージェントが使用すべきモデル名を返す（短縮名）
 get_agent_model() {
     local agent_id="$1"
 
@@ -338,19 +369,52 @@ get_model_display_name() {
 # get_startup_prompt(agent_id)
 # CLIが初回起動時に自動実行すべき初期プロンプトを返す
 # Codex CLI: [PROMPT]引数として渡す（サジェストUI停止問題の根本対策）
+# Copilot CLI: 初期プロンプトとして渡す（copilot-instructions.mdは読むがロール特定できない）
 # Claude Code: 空（CLAUDE.md自動読込でSession Start手順が起動）
-# Copilot/Kimi: 空（今後対応）
+# Kimi: 空（今後対応）
+#
+# ロール別プロンプト:
+#   shogun: 指示書を読み、戦略設定＋家老へ委任。自分でタスク実行しない。
+#   karo:   指示書を読み、コマンドをサブタスクに分解し足軽/軍師へ割当。
+#   gunshi: 指示書を読み、戦略タスクを実行。
+#   ashigaru: タスクYAMLを読み、割当タスクを実行。
 get_startup_prompt() {
     local agent_id="$1"
     local cli_type
     cli_type=$(get_cli_type "$agent_id")
 
+    # ロール判定
+    local role
+    case "$agent_id" in
+        shogun)    role="shogun" ;;
+        karo)      role="karo" ;;
+        gunshi)    role="gunshi" ;;
+        ashigaru*) role="ashigaru" ;;
+        *)         role="ashigaru" ;;
+    esac
+
+    # CLI別の指示書パス（絶対パス — shogunは別ディレクトリで起動するため）
+    local base="$CLI_ADAPTER_PROJECT_ROOT"
+    local instr_file
     case "$cli_type" in
-        codex)
-            echo "Session Start — do ALL of this in one turn, do NOT stop early: 1) tmux display-message -t \"\$TMUX_PANE\" -p '#{@agent_id}' to identify yourself. 2) Read queue/tasks/${agent_id}.yaml. 3) Read queue/inbox/${agent_id}.yaml, mark read:true. 4) Read files listed in context_files. 5) Execute the assigned task to completion — edit files, run commands, write reports. Keep working until the task is done."
+        copilot) instr_file="${base}/instructions/generated/copilot-${role}.md" ;;
+        codex)   instr_file="${base}/instructions/generated/codex-${role}.md" ;;
+        *)       echo ""; return ;;
+    esac
+
+    # ロール別プロンプト生成（全パス絶対パス）
+    case "$role" in
+        shogun)
+            echo "Session Start — do ALL of this in one turn: 1) Run: tmux display-message -t \"\$TMUX_PANE\" -p '#{@agent_id}' to identify yourself as SHOGUN. 2) Read ${instr_file} — your CRITICAL role instructions. Follow them exactly. 3) Read ${base}/memory/MEMORY.md for persistent memory (skip if missing). 4) Read ${base}/queue/shogun_to_karo.yaml for current command status, and ${base}/dashboard.md for system overview (skip if missing). 5) You are the SHOGUN. Set strategy and write commands to ${base}/queue/shogun_to_karo.yaml for Karo to execute. NEVER execute tasks yourself — delegate EVERYTHING through Karo. Wait for the Lord (human) to give you orders."
             ;;
-        *)
-            echo ""
+        karo)
+            echo "Session Start — do ALL of this in one turn: 1) Run: tmux display-message -t \"\$TMUX_PANE\" -p '#{@agent_id}' to identify yourself as KARO. 2) Read ${instr_file} — your CRITICAL role instructions. Follow them exactly. 3) Read ${base}/queue/shogun_to_karo.yaml for commands from Shogun. 4) Read ${base}/queue/inbox/karo.yaml, mark read:true. 5) You are the KARO. Break Shogun commands into subtasks, assign to ashigaru/gunshi via ${base}/queue/tasks/. Manage all task flow. Do NOT execute implementation tasks yourself. CRITICAL: NEVER ask questions or wait for confirmation. There is NO human at this terminal. Always proceed autonomously. INBOX RULE: ONLY read queue/inbox/karo.yaml. NEVER read queue/inbox/ashigaru*.yaml or queue/inbox/gunshi.yaml — those belong to other agents."
+            ;;
+        gunshi)
+            echo "Session Start — do ALL of this in one turn: 1) Run: tmux display-message -t \"\$TMUX_PANE\" -p '#{@agent_id}' to identify yourself as GUNSHI. 2) Read ${instr_file} — your CRITICAL role instructions. 3) Read ${base}/queue/tasks/gunshi.yaml. 4) Read ${base}/queue/inbox/gunshi.yaml, mark read:true. 5) If task has context_files, read them. 6) Execute the assigned strategic task to completion. 7) CRITICAL — after completing the task and writing your report YAML, you MUST notify Karo by running: bash ${base}/scripts/inbox_write.sh karo \"gunshi、任務完了でござる。報告書を確認されよ。\" report_received gunshi — without this, Karo will never know you finished. NEVER ask questions or wait for confirmation — there is NO human at this terminal."
+            ;;
+        ashigaru)
+            echo "Session Start — do ALL of this in one turn, do NOT stop early: 1) Run: tmux display-message -t \"\$TMUX_PANE\" -p '#{@agent_id}' to identify yourself. 2) Read ${instr_file} — your role instructions. 3) Read ${base}/queue/tasks/${agent_id}.yaml. 4) Read ${base}/queue/inbox/${agent_id}.yaml, mark read:true. 5) If task has context_files, read them. 6) Execute the assigned task to completion — edit files, run commands, write reports. Keep working until the task is done. 7) CRITICAL — after completing the task and writing your report YAML, you MUST notify Karo by running: bash ${base}/scripts/inbox_write.sh karo \"${agent_id}、任務完了でござる。報告書を確認されよ。\" report_received ${agent_id} — without this, Karo will never know you finished and dependent tasks will stay blocked. NEVER ask questions or wait for confirmation — there is NO human at this terminal."
             ;;
     esac
 }

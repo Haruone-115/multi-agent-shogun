@@ -10,6 +10,9 @@
 
 set -e
 
+# 起動元ディレクトリを保存（将軍ペインの作業ディレクトリに使用）
+CALLER_DIR="$(pwd)"
+
 # スクリプトのディレクトリを取得
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
@@ -82,6 +85,134 @@ log_war() {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# CLI起動＋プロンプト配信ヘルパー
+# ───────────────────────────────────────────────────────────────────────────────
+# CLI種別に応じてプロンプト配信方法を切り替える
+#   codex:   CLI引数として付加 (codex "prompt")
+#   copilot: TUIなので引数不可。起動後にsend-keysで送信
+#   claude:  プロンプト不要（CLAUDE.md自動読込）
+#
+# 使用法: launch_agent_cli <tmux_target> <cli_type> <cli_cmd> [startup_prompt]
+# ═══════════════════════════════════════════════════════════════════════════════
+_COPILOT_DEFERRED_PROMPTS=()
+launch_agent_cli() {
+    local tmux_target="$1"
+    local cli_type="$2"
+    local cli_cmd="$3"
+    local startup_prompt="${4:-}"
+
+    if [[ -n "$startup_prompt" && "$cli_type" == "copilot" ]]; then
+        # Copilot: TUIなのでCLI引数不可。起動後にsend-keysで配信（後でまとめて送信）
+        tmux send-keys -t "$tmux_target" "$cli_cmd"
+        tmux send-keys -t "$tmux_target" Enter
+        _COPILOT_DEFERRED_PROMPTS+=("${tmux_target}|||${startup_prompt}")
+    elif [[ -n "$startup_prompt" ]]; then
+        # Codex等: CLI引数として付加
+        tmux send-keys -t "$tmux_target" "$cli_cmd \"$startup_prompt\""
+        tmux send-keys -t "$tmux_target" Enter
+    else
+        # Claude等: プロンプト不要
+        tmux send-keys -t "$tmux_target" "$cli_cmd"
+        tmux send-keys -t "$tmux_target" Enter
+    fi
+}
+
+# get_agent_model()の短縮名 → Copilot CLIモデル文字列に変換
+_map_model_to_copilot() {
+    local model="$1"
+    # 短縮名 → Copilot TUI用フルモデル名
+    case "$model" in
+        opus)   echo "claude-opus-4.6" ;;
+        sonnet) echo "claude-sonnet-4.6" ;;
+        haiku)  echo "claude-haiku-4.5" ;;
+        "")    echo "" ;;  # 空ならスキップ
+        *)      echo "$model" ;;  # フルモデル名（gpt-5.3-codex等）はそのまま
+    esac
+}
+
+# Copilot TUI起動待ち後にまとめてプロンプトを送信
+# 全ペインを並列で待機し、準備できたペインから順次 /model + プロンプトを送信する
+# タイムアウト: 最大120秒（並列待機なので合計時間 = max(個別待機) 程度）
+deliver_copilot_prompts() {
+    if [[ ${#_COPILOT_DEFERRED_PROMPTS[@]} -eq 0 ]]; then
+        return 0
+    fi
+    local total=${#_COPILOT_DEFERRED_PROMPTS[@]}
+    log_info "  └─ Copilot TUI初期化待ち（${total}エージェント並列待機）..."
+
+    local max_wait=120
+
+    # Phase 1: 全ペインの TUI 準備完了を並列待機
+    local targets=()
+    local prompts=()
+    for entry in "${_COPILOT_DEFERRED_PROMPTS[@]}"; do
+        targets+=("${entry%%|||*}")
+        prompts+=("${entry#*|||}")
+    done
+
+    # 全ペインが "Type @" を表示するまで並列ポーリング（最大120秒）
+    local waited=0
+    while [[ $waited -lt $max_wait ]]; do
+        local all_ready=true
+        for target in "${targets[@]}"; do
+            local pc
+            pc=$(tmux capture-pane -t "$target" -p 2>/dev/null || echo "")
+            if ! echo "$pc" | grep -qE "Type @|Type a message"; then
+                all_ready=false
+                break
+            fi
+        done
+        if $all_ready; then
+            break
+        fi
+        sleep 2
+        waited=$((waited + 2))
+    done
+
+    if [[ $waited -ge $max_wait ]]; then
+        log_war "  ⚠️ Copilot TUI準備タイムアウト（${max_wait}秒）。15秒追加待機後に送信を試行..."
+        sleep 15
+    fi
+
+    # Phase 2: /model 切り替え → プロンプト送信（順次実行：tmux send-keys の競合回避）
+    for i in "${!targets[@]}"; do
+        local target="${targets[$i]}"
+        local prompt="${prompts[$i]}"
+
+        # モデル自動切り替え
+        local agent_id
+        agent_id=$(tmux show-options -p -v -t "$target" @agent_id 2>/dev/null || echo "")
+        if [[ -n "$agent_id" ]]; then
+            local short_model copilot_model
+            short_model=$(get_agent_model "$agent_id" 2>/dev/null || echo "")
+            copilot_model=$(_map_model_to_copilot "$short_model")
+            if [[ -n "$copilot_model" ]]; then
+                # テキストとEnterを分離送信（結合防止）
+                tmux send-keys -t "$target" "/model $copilot_model"
+                sleep 0.3
+                tmux send-keys -t "$target" Enter
+                # モデル切り替え完了（Type @復帰）まで最大20秒待機
+                local mwait=0
+                while [[ $mwait -lt 20 ]]; do
+                    sleep 1; mwait=$((mwait + 1))
+                    local mc
+                    mc=$(tmux capture-pane -t "$target" -p 2>/dev/null || echo "")
+                    if echo "$mc" | grep -qE "Type @|Type a message"; then break; fi
+                done
+            fi
+        fi
+
+        # プロンプト送信もテキストとEnterを分離
+        tmux send-keys -t "$target" "$prompt"
+        sleep 0.3
+        tmux send-keys -t "$target" Enter
+        sleep 1
+    done
+    _COPILOT_DEFERRED_PROMPTS=()
+    log_info "  └─ Copilot初期プロンプト送信完了（全${total}エージェント）"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # プロンプト生成関数（bash/zsh対応）
 # ───────────────────────────────────────────────────────────────────────────────
 # 使用法: generate_prompt "ラベル" "色" "シェル"
@@ -121,9 +252,19 @@ KESSEN_MODE=false
 SHOGUN_NO_THINKING=false
 SILENT_MODE=false
 SHELL_OVERRIDE=""
+WORK_DIR_OVERRIDE=""
 
 while [[ $# -gt 0 ]]; do
     case $1 in
+        -d|--dir)
+            if [[ -n "$2" && "$2" != -* ]]; then
+                WORK_DIR_OVERRIDE="$2"
+                shift 2
+            else
+                echo "エラー: -d オプションには作業ディレクトリのパスを指定してください"
+                exit 1
+            fi
+            ;;
         -s|--setup-only)
             SETUP_ONLY=true
             shift
@@ -166,6 +307,8 @@ while [[ $# -gt 0 ]]; do
             echo "オプション:"
             echo "  -c, --clean         キューとダッシュボードをリセットして起動（クリーンスタート）"
             echo "                      未指定時は前回の状態を維持して起動"
+            echo "  -d, --dir DIR       将軍ペインの作業ディレクトリを指定"
+            echo "                      未指定時は起動元ディレクトリを使用"
             echo "  -k, --kessen        決戦の陣（全足軽をOpusで起動）"
             echo "                      未指定時は平時の陣（足軽1-7=Sonnet, 軍師=Opus）"
             echo "  -s, --setup-only    tmuxセッションのセットアップのみ（Claude起動なし）"
@@ -516,9 +659,12 @@ fi
 tmux set-option -g window-size latest
 tmux set-option -g aggressive-resize on
 
+# 将軍の作業ディレクトリ: -d指定 > 起動元ディレクトリ > スクリプトディレクトリ
+SHOGUN_WORK_DIR="${WORK_DIR_OVERRIDE:-$CALLER_DIR}"
+
 # 将軍ペインはウィンドウ名 "main" で指定（base-index 1 環境でも動く）
 SHOGUN_PROMPT=$(generate_prompt "将軍" "magenta" "$SHELL_SETTING")
-tmux send-keys -t shogun:main "cd \"$(pwd)\" && export PS1='${SHOGUN_PROMPT}' && clear" Enter
+tmux send-keys -t shogun:main "cd \"${SHOGUN_WORK_DIR}\" && export PS1='${SHOGUN_PROMPT}' && clear" Enter
 tmux select-pane -t shogun:main -P 'bg=#002b36'  # 将軍の Solarized Dark
 tmux set-option -p -t shogun:main @agent_id "shogun"
 
@@ -677,9 +823,13 @@ with open(f,'w') as fh: yaml.safe_dump(d, fh, default_flow_style=False, allow_un
         _shogun_cmd=$(build_cli_command "shogun")
         log_info "  └─ 将軍 settings.yaml thinking=false に設定"
     fi
+    # 初期プロンプト取得＋CLI起動（copilot=TUI後送信、codex=CLI引数、claude=不要）
+    _startup_prompt=""
+    if [ "$CLI_ADAPTER_LOADED" = true ]; then
+        _startup_prompt=$(get_startup_prompt "shogun" 2>/dev/null)
+    fi
     tmux set-option -p -t "shogun:main" @agent_cli "$_shogun_cli_type"
-    tmux send-keys -t shogun:main "$_shogun_cmd"
-    tmux send-keys -t shogun:main Enter
+    launch_agent_cli "shogun:main" "$_shogun_cli_type" "$_shogun_cmd" "$_startup_prompt"
     _shogun_display=$(get_model_display_name "shogun" 2>/dev/null || echo "Opus")
     tmux set-option -p -t "shogun:main" @model_name "$_shogun_display" 2>/dev/null || true
     log_info "  └─ 将軍（${_shogun_cli_type} / ${_shogun_display}）、召喚完了"
@@ -695,14 +845,10 @@ with open(f,'w') as fh: yaml.safe_dump(d, fh, default_flow_style=False, allow_un
         _karo_cli_type=$(get_cli_type "karo")
         _karo_cmd=$(build_cli_command "karo")
     fi
-    # Codex等の初期プロンプト付加（サジェストUI停止問題対策）
+    # 初期プロンプト取得＋CLI起動
     _startup_prompt=$(get_startup_prompt "karo" 2>/dev/null)
-    if [[ -n "$_startup_prompt" ]]; then
-        _karo_cmd="$_karo_cmd \"$_startup_prompt\""
-    fi
     tmux set-option -p -t "multiagent:agents.${p}" @agent_cli "$_karo_cli_type"
-    tmux send-keys -t "multiagent:agents.${p}" "$_karo_cmd"
-    tmux send-keys -t "multiagent:agents.${p}" Enter
+    launch_agent_cli "multiagent:agents.${p}" "$_karo_cli_type" "$_karo_cmd" "$_startup_prompt"
     _karo_display=$(get_model_display_name "karo" 2>/dev/null || echo "Sonnet")
     tmux set-option -p -t "multiagent:agents.${p}" @model_name "$_karo_display" 2>/dev/null || true
     log_info "  └─ 家老（${_karo_display}）、召喚完了"
@@ -721,14 +867,10 @@ with open(f,'w') as fh: yaml.safe_dump(d, fh, default_flow_style=False, allow_un
                     _ashi_cmd=$(build_cli_command "ashigaru${i}")
                 fi
             fi
-            # Codex等の初期プロンプト付加（サジェストUI停止問題対策）
+            # 初期プロンプト取得＋CLI起動
             _startup_prompt=$(get_startup_prompt "ashigaru${i}" 2>/dev/null)
-            if [[ -n "$_startup_prompt" ]]; then
-                _ashi_cmd="$_ashi_cmd \"$_startup_prompt\""
-            fi
             tmux set-option -p -t "multiagent:agents.${p}" @agent_cli "$_ashi_cli_type"
-            tmux send-keys -t "multiagent:agents.${p}" "$_ashi_cmd"
-            tmux send-keys -t "multiagent:agents.${p}" Enter
+            launch_agent_cli "multiagent:agents.${p}" "$_ashi_cli_type" "$_ashi_cmd" "$_startup_prompt"
         done
         log_info "  └─ 足軽1-${_ASHIGARU_COUNT}（決戦の陣）、召喚完了"
     else
@@ -741,14 +883,10 @@ with open(f,'w') as fh: yaml.safe_dump(d, fh, default_flow_style=False, allow_un
                 _ashi_cli_type=$(get_cli_type "ashigaru${i}")
                 _ashi_cmd=$(build_cli_command "ashigaru${i}")
             fi
-            # Codex等の初期プロンプト付加（サジェストUI停止問題対策）
+            # 初期プロンプト取得＋CLI起動
             _startup_prompt=$(get_startup_prompt "ashigaru${i}" 2>/dev/null)
-            if [[ -n "$_startup_prompt" ]]; then
-                _ashi_cmd="$_ashi_cmd \"$_startup_prompt\""
-            fi
             tmux set-option -p -t "multiagent:agents.${p}" @agent_cli "$_ashi_cli_type"
-            tmux send-keys -t "multiagent:agents.${p}" "$_ashi_cmd"
-            tmux send-keys -t "multiagent:agents.${p}" Enter
+            launch_agent_cli "multiagent:agents.${p}" "$_ashi_cli_type" "$_ashi_cmd" "$_startup_prompt"
         done
         log_info "  └─ 足軽1-${_ASHIGARU_COUNT}（平時の陣）、召喚完了"
     fi
@@ -761,14 +899,10 @@ with open(f,'w') as fh: yaml.safe_dump(d, fh, default_flow_style=False, allow_un
         _gunshi_cli_type=$(get_cli_type "gunshi")
         _gunshi_cmd=$(build_cli_command "gunshi")
     fi
-    # Codex等の初期プロンプト付加（サジェストUI停止問題対策）
+    # 初期プロンプト取得＋CLI起動
     _startup_prompt=$(get_startup_prompt "gunshi" 2>/dev/null)
-    if [[ -n "$_startup_prompt" ]]; then
-        _gunshi_cmd="$_gunshi_cmd \"$_startup_prompt\""
-    fi
     tmux set-option -p -t "multiagent:agents.${p}" @agent_cli "$_gunshi_cli_type"
-    tmux send-keys -t "multiagent:agents.${p}" "$_gunshi_cmd"
-    tmux send-keys -t "multiagent:agents.${p}" Enter
+    launch_agent_cli "multiagent:agents.${p}" "$_gunshi_cli_type" "$_gunshi_cmd" "$_startup_prompt"
     _gunshi_display=$(get_model_display_name "gunshi" 2>/dev/null || echo "Opus+T")
     tmux set-option -p -t "multiagent:agents.${p}" @model_name "$_gunshi_display" 2>/dev/null || true
     log_info "  └─ 軍師（${_gunshi_display}）、召喚完了"
@@ -778,6 +912,10 @@ with open(f,'w') as fh: yaml.safe_dump(d, fh, default_flow_style=False, allow_un
     else
         log_success "✅ 平時の陣で出陣（家老=Sonnet, 足軽=Sonnet, 軍師=Opus）"
     fi
+
+    # Copilot TUI起動待ち → まとめて初期プロンプト送信
+    deliver_copilot_prompts
+
     echo ""
 
     # ═══════════════════════════════════════════════════════════════════════════

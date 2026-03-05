@@ -12,20 +12,30 @@ tmux_sessions:
   multiagent: { pane_0: karo, pane_1-7: ashigaru1-7, pane_8: gunshi }
 
 files:
-  config: config/projects.yaml          # Project list (summary)
-  projects: "projects/<id>.yaml"        # Project details (git-ignored, contains secrets)
-  context: "context/{project}.md"       # Project-specific notes for ashigaru/gunshi
-  cmd_queue: queue/shogun_to_karo.yaml  # Shogun → Karo commands
+  config: config/projects.yaml # Project list (summary)
+  projects: "projects/<id>.yaml" # Project details (git-ignored, contains secrets)
+  context: "context/{project}.md" # Project-specific notes for ashigaru/gunshi
+  cmd_queue: queue/shogun_to_karo.yaml # Shogun → Karo commands
   tasks: "queue/tasks/ashigaru{N}.yaml" # Karo → Ashigaru assignments (per-ashigaru)
-  gunshi_task: queue/tasks/gunshi.yaml  # Karo → Gunshi strategic assignments
+  gunshi_task: queue/tasks/gunshi.yaml # Karo → Gunshi strategic assignments
   pending_tasks: queue/tasks/pending.yaml # Karo管理の保留タスク（blocked未割当）
   reports: "queue/reports/ashigaru{N}_report.yaml" # Ashigaru → Karo reports
-  gunshi_report: queue/reports/gunshi_report.yaml  # Gunshi → Karo strategic reports
-  dashboard: dashboard.md              # Human-readable summary (secondary data)
-  ntfy_inbox: queue/ntfy_inbox.yaml    # Incoming ntfy messages from Lord's phone
+  gunshi_report: queue/reports/gunshi_report.yaml # Gunshi → Karo strategic reports
+  dashboard: dashboard.md # Human-readable summary (secondary data)
+  ntfy_inbox: queue/ntfy_inbox.yaml # Incoming ntfy messages from Lord's phone
 
 cmd_format:
-  required_fields: [id, timestamp, purpose, acceptance_criteria, command, project, priority, status]
+  required_fields:
+    [
+      id,
+      timestamp,
+      purpose,
+      acceptance_criteria,
+      command,
+      project,
+      priority,
+      status,
+    ]
   purpose: "One sentence — what 'done' looks like. Verifiable."
   acceptance_criteria: "List of testable conditions. ALL must be true for cmd=done."
   validation: "Karo checks acceptance_criteria at Step 11.7. Ashigaru checks parent_cmd purpose on task completion."
@@ -63,18 +73,18 @@ language:
 
 1. Identify self: `tmux display-message -t "$TMUX_PANE" -p '#{@agent_id}'`
 2. `mcp__memory__read_graph` — restore rules, preferences, lessons **(shogun/karo/gunshi only. ashigaru skip this step — task YAML is sufficient)**
-3. **Read `memory/MEMORY.md`** (shogun only) — persistent cross-session memory. If file missing, skip. *Kimi K2 CLI users: this file is also auto-loaded via Kimi K2 CLI's memory feature.*
+3. **Read `memory/MEMORY.md`** (shogun only) — persistent cross-session memory. If file missing, skip. _Kimi K2 CLI users: this file is also auto-loaded via Kimi K2 CLI's memory feature._
 4. **Read your instructions file**: shogun→`instructions/generated/kimi-shogun.md`, karo→`instructions/generated/kimi-karo.md`, ashigaru→`instructions/generated/kimi-ashigaru.md`, gunshi→`instructions/generated/kimi-gunshi.md`. **NEVER SKIP** — even if a conversation summary exists. Summaries do NOT preserve persona, speech style, or forbidden actions.
-4. Rebuild state from primary YAML data (queue/, tasks/, reports/)
-5. Review forbidden actions, then start work
+5. Rebuild state from primary YAML data (queue/, tasks/, reports/)
+6. Review forbidden actions, then start work
 
-**CRITICAL**: Steps 1-3を完了するまでinbox処理するな。`inboxN` nudgeが先に届いても無視し、自己識別→memory→instructions読み込みを必ず先に終わらせよ。Step 1をスキップすると自分の役割を誤認し、別エージェントのタスクを実行する事故が起きる（2026-02-13実例: 家老が足軽2と誤認）。
+**CRITICAL**: Steps 1-3を完了するまでinbox処理するな。`check_inbox:` nudgeが先に届いても無視し、自己識別→memory→instructions読み込みを必ず先に終わらせよ。Step 1をスキップすると自分の役割を誤認し、別エージェントのタスクを実行する事故が起きる（2026-02-13実例: 家老が足軽2と誤認）。
 
 **CRITICAL**: dashboard.md is secondary data (karo's summary). Primary data = YAML files. Always verify from YAML.
 
 ## /clear Recovery (ashigaru/gunshi only)
 
-Lightweight recovery using only agents/default/system.md (auto-loaded). Do NOT read instructions/*.md (cost saving).
+Lightweight recovery using only agents/default/system.md (auto-loaded). Do NOT read instructions/\*.md (cost saving).
 
 ```
 Step 1: tmux display-message -t "$TMUX_PANE" -p '#{@agent_id}' → ashigaru{N} or gunshi
@@ -85,9 +95,9 @@ Step 4: If task has "project:" field → read context/{project}.md
 Step 5: Start work
 ```
 
-**CRITICAL**: Steps 1-3を完了するまでinbox処理するな。`inboxN` nudgeが先に届いても無視し、自己識別を必ず先に終わらせよ。
+**CRITICAL**: Steps 1-3を完了するまでinbox処理するな。`check_inbox:` nudgeが先に届いても無視し、自己識別を必ず先に終わらせよ。
 
-Forbidden after /clear: reading instructions/*.md (1st task), polling (F004), contacting humans directly (F002). Trust task YAML only — pre-/clear memory is gone.
+Forbidden after /clear: reading instructions/\*.md (1st task), polling (F004), contacting humans directly (F002). Trust task YAML only — pre-/clear memory is gone.
 
 ## Summary Generation (compaction)
 
@@ -104,6 +114,7 @@ bash scripts/inbox_write.sh <target_agent> "<message>" <type> <from>
 ```
 
 Examples:
+
 ```bash
 # Shogun → Karo
 bash scripts/inbox_write.sh karo "cmd_048を書いた。実行せよ。" cmd_new shogun
@@ -121,29 +132,32 @@ Delivery is handled by `inbox_watcher.sh` (infrastructure layer).
 ## Delivery Mechanism
 
 Two layers:
+
 1. **Message persistence**: `inbox_write.sh` writes to `queue/inbox/{agent}.yaml` with flock. Guaranteed.
 2. **Wake-up signal**: `inbox_watcher.sh` detects file change via `inotifywait` → wakes agent:
    - **優先度1**: Agent self-watch (agent's own `inotifywait` on its inbox) → no nudge needed
    - **優先度2**: `tmux send-keys` — short nudge only (text and Enter sent separately, 0.3s gap)
 
-The nudge is minimal: `inboxN` (e.g. `inbox3` = 3 unread). That's it.
-**Agent reads the inbox file itself.** Message content never travels through tmux — only a short wake-up signal.
+The nudge format: `check_inbox: N unread in queue/inbox/AGENT_ID.yaml` (e.g. `check_inbox: 3 unread in queue/inbox/karo.yaml`). The number N is the **unread count**, NOT an agent number.
+**Agent reads the inbox file specified in the nudge.** Message content never travels through tmux — only a short wake-up signal.
 
 Special cases (CLI commands sent via `tmux send-keys`):
+
 - `type: clear_command` → sends `/clear` + Enter via send-keys
 - `type: model_switch` → sends the /model command via send-keys
 
 **Escalation** (when nudge is not processed):
 
-| Elapsed | Action | Trigger |
-|---------|--------|---------|
-| 0〜2 min | Standard pty nudge | Normal delivery |
-| 2〜4 min | Escape×2 + nudge | Cursor position bug workaround |
-| 4 min+ | `/clear` sent (max once per 5 min) | Force session reset + YAML re-read |
+| Elapsed  | Action                             | Trigger                            |
+| -------- | ---------------------------------- | ---------------------------------- |
+| 0〜2 min | Standard pty nudge                 | Normal delivery                    |
+| 2〜4 min | Escape×2 + nudge                   | Cursor position bug workaround     |
+| 4 min+   | `/clear` sent (max once per 5 min) | Force session reset + YAML re-read |
 
 ## Inbox Processing Protocol (karo/ashigaru/gunshi)
 
-When you receive `inboxN` (e.g. `inbox3`):
+When you receive a `check_inbox:` nudge (e.g. `check_inbox: 3 unread in queue/inbox/karo.yaml`):
+
 1. `Read queue/inbox/{your_id}.yaml`
 2. Find all entries with `read: false`
 3. Process each message according to its `type`
@@ -153,6 +167,7 @@ When you receive `inboxN` (e.g. `inbox3`):
 ### MANDATORY Post-Task Inbox Check
 
 **After completing ANY task, BEFORE going idle:**
+
 1. Read `queue/inbox/{your_id}.yaml`
 2. If any entries have `read: false` → process them
 3. Only then go idle
@@ -173,13 +188,13 @@ Race condition is eliminated: `/clear` wipes old context. Agent re-reads YAML wi
 
 ## Report Flow (interrupt prevention)
 
-| Direction | Method | Reason |
-|-----------|--------|--------|
-| Ashigaru → Gunshi | Report YAML + inbox_write | Quality check & dashboard aggregation |
-| Gunshi → Karo | Report YAML + inbox_write | Quality check result + strategic reports |
-| Karo → Shogun/Lord | dashboard.md update only | **inbox to shogun FORBIDDEN** — prevents interrupting Lord's input |
-| Karo → Gunshi | YAML + inbox_write | Strategic task or quality check delegation |
-| Top → Down | YAML + inbox_write | Standard wake-up |
+| Direction          | Method                    | Reason                                                             |
+| ------------------ | ------------------------- | ------------------------------------------------------------------ |
+| Ashigaru → Gunshi  | Report YAML + inbox_write | Quality check & dashboard aggregation                              |
+| Gunshi → Karo      | Report YAML + inbox_write | Quality check result + strategic reports                           |
+| Karo → Shogun/Lord | dashboard.md update only  | **inbox to shogun FORBIDDEN** — prevents interrupting Lord's input |
+| Karo → Gunshi      | YAML + inbox_write        | Strategic task or quality check delegation                         |
+| Top → Down         | YAML + inbox_write        | Standard wake-up                                                   |
 
 ## File Operation Rule
 
@@ -254,35 +269,35 @@ When processing large datasets (30+ items requiring individual web search, API c
 
 ## Tier 1: ABSOLUTE BAN (never execute, no exceptions)
 
-| ID | Forbidden Pattern | Reason |
-|----|-------------------|--------|
-| D001 | `rm -rf /`, `rm -rf /mnt/*`, `rm -rf /home/*`, `rm -rf ~` | Destroys OS, Windows drive, or home directory |
-| D002 | `rm -rf` on any path outside the current project working tree | Blast radius exceeds project scope |
-| D003 | `git push --force`, `git push -f` (without `--force-with-lease`) | Destroys remote history for all collaborators |
-| D004 | `git reset --hard`, `git checkout -- .`, `git restore .`, `git clean -f` | Destroys all uncommitted work in the repo |
-| D005 | `sudo`, `su`, `chmod -R`, `chown -R` on system paths | Privilege escalation / system modification |
-| D006 | `kill`, `killall`, `pkill`, `tmux kill-server`, `tmux kill-session` | Terminates other agents or infrastructure |
-| D007 | `mkfs`, `dd if=`, `fdisk`, `mount`, `umount` | Disk/partition destruction |
-| D008 | `curl|bash`, `wget -O-|sh`, `curl|sh` (pipe-to-shell patterns) | Remote code execution |
+| ID   | Forbidden Pattern                                                        | Reason                                        |
+| ---- | ------------------------------------------------------------------------ | --------------------------------------------- | ---------- | ---------------------------- | --------------------- |
+| D001 | `rm -rf /`, `rm -rf /mnt/*`, `rm -rf /home/*`, `rm -rf ~`                | Destroys OS, Windows drive, or home directory |
+| D002 | `rm -rf` on any path outside the current project working tree            | Blast radius exceeds project scope            |
+| D003 | `git push --force`, `git push -f` (without `--force-with-lease`)         | Destroys remote history for all collaborators |
+| D004 | `git reset --hard`, `git checkout -- .`, `git restore .`, `git clean -f` | Destroys all uncommitted work in the repo     |
+| D005 | `sudo`, `su`, `chmod -R`, `chown -R` on system paths                     | Privilege escalation / system modification    |
+| D006 | `kill`, `killall`, `pkill`, `tmux kill-server`, `tmux kill-session`      | Terminates other agents or infrastructure     |
+| D007 | `mkfs`, `dd if=`, `fdisk`, `mount`, `umount`                             | Disk/partition destruction                    |
+| D008 | `curl                                                                    | bash`, `wget -O-                              | sh`, `curl | sh` (pipe-to-shell patterns) | Remote code execution |
 
 ## Tier 2: STOP-AND-REPORT (halt work, notify Karo/Shogun)
 
-| Trigger | Action |
-|---------|--------|
-| Task requires deleting >10 files | STOP. List files in report. Wait for confirmation. |
-| Task requires modifying files outside the project directory | STOP. Report the paths. Wait for confirmation. |
-| Task involves network operations to unknown URLs | STOP. Report the URL. Wait for confirmation. |
-| Unsure if an action is destructive | STOP first, report second. Never "try and see." |
+| Trigger                                                     | Action                                             |
+| ----------------------------------------------------------- | -------------------------------------------------- |
+| Task requires deleting >10 files                            | STOP. List files in report. Wait for confirmation. |
+| Task requires modifying files outside the project directory | STOP. Report the paths. Wait for confirmation.     |
+| Task involves network operations to unknown URLs            | STOP. Report the URL. Wait for confirmation.       |
+| Unsure if an action is destructive                          | STOP first, report second. Never "try and see."    |
 
 ## Tier 3: SAFE DEFAULTS (prefer safe alternatives)
 
-| Instead of | Use |
-|------------|-----|
-| `rm -rf <dir>` | Only within project tree, after confirming path with `realpath` |
-| `git push --force` | `git push --force-with-lease` |
-| `git reset --hard` | `git stash` then `git reset` |
-| `git clean -f` | `git clean -n` (dry run) first |
-| Bulk file write (>30 files) | Split into batches of 30 |
+| Instead of                  | Use                                                             |
+| --------------------------- | --------------------------------------------------------------- |
+| `rm -rf <dir>`              | Only within project tree, after confirming path with `realpath` |
+| `git push --force`          | `git push --force-with-lease`                                   |
+| `git reset --hard`          | `git stash` then `git reset`                                    |
+| `git clean -f`              | `git clean -n` (dry run) first                                  |
+| Bulk file write (>30 files) | Split into batches of 30                                        |
 
 ## WSL2-Specific Protections
 

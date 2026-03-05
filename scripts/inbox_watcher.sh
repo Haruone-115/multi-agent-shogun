@@ -218,7 +218,7 @@ should_throttle_nudge() {
     if [ "${LAST_NUDGE_COUNT:-}" = "$unread_count" ] && [ "${LAST_NUDGE_TS:-0}" -gt 0 ]; then
         local age=$((now - LAST_NUDGE_TS))
         if [ "$age" -lt "${cooldown_sec}" ]; then
-            echo "[$(date)] [SKIP] Throttling nudge for $AGENT_ID: inbox${unread_count} (${age}s < ${cooldown_sec}s, cli=$effective_cli)" >&2
+            echo "[$(date)] [SKIP] Throttling nudge for $AGENT_ID: check_inbox:${unread_count} (${age}s < ${cooldown_sec}s, cli=$effective_cli)" >&2
             return 0
         fi
     fi
@@ -753,7 +753,7 @@ session_has_client() {
 #   3. tmux send-keys (短いnudgeのみ、timeout 5s)
 send_wakeup() {
     local unread_count="$1"
-    local nudge="inbox${unread_count}"
+    local nudge="check_inbox: ${unread_count} unread in queue/inbox/${AGENT_ID}.yaml"
 
     if [ "${FINAL_ESCALATION_ONLY:-0}" = "1" ]; then
         echo "[$(date)] [SKIP] FINAL_ESCALATION_ONLY=1, suppressing normal nudge for $AGENT_ID" >&2
@@ -819,7 +819,7 @@ send_wakeup() {
 # Addresses the "echo last tool call" cursor position bug and stale input.
 send_wakeup_with_escape() {
     local unread_count="$1"
-    local nudge="inbox${unread_count}"
+    local nudge="check_inbox: ${unread_count} unread in queue/inbox/${AGENT_ID}.yaml"
     local effective_cli
     effective_cli=$(get_effective_cli_type)
     local c_ctrl_state="skipped"
@@ -843,6 +843,13 @@ send_wakeup_with_escape() {
     # Escape送信は処理中のturnを中断させるため有害。Phase 2は通常nudgeに落とす。
     if [[ "$effective_cli" == "claude" ]]; then
         echo "[$(date)] [SKIP] claude: suppressing Escape escalation for $AGENT_ID (Stop hook handles delivery); sending plain nudge" >&2
+        send_wakeup "$unread_count"
+        return 0
+    fi
+
+    # Copilot CLI: Escape/C-cはTUIモードを壊す。Phase 2は通常nudgeに落とす。
+    if [[ "$effective_cli" == "copilot" ]]; then
+        echo "[$(date)] [SKIP] copilot: suppressing Escape escalation for $AGENT_ID (TUI safety); sending plain nudge" >&2
         send_wakeup "$unread_count"
         return 0
     fi

@@ -67,6 +67,13 @@ agent_is_busy_check() {
     fi
 
     # ── Idle checks ──
+    # Copilot CLI idle prompt
+    if echo "$pane_tail" | grep -qF 'Type @'; then
+        return 1
+    fi
+    if echo "$pane_tail" | grep -qF 'shift+tab switch mode'; then
+        return 1
+    fi
     # Codex idle prompt
     if echo "$pane_tail" | grep -qE '(\? for shortcuts|context left)'; then
         return 1

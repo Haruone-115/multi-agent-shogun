@@ -9,6 +9,7 @@ bash scripts/inbox_write.sh <target_agent> "<message>" <type> <from>
 ```
 
 Examples:
+
 ```bash
 # Shogun → Karo
 bash scripts/inbox_write.sh karo "cmd_048を書いた。実行せよ。" cmd_new shogun
@@ -26,19 +27,22 @@ Delivery is handled by `inbox_watcher.sh` (infrastructure layer).
 ## Delivery Mechanism
 
 Two layers:
+
 1. **Message persistence**: `inbox_write.sh` writes to `queue/inbox/{agent}.yaml` with flock. Guaranteed.
 2. **Wake-up signal**: `inbox_watcher.sh` detects file change via `inotifywait` → wakes agent:
    - **Priority 1**: Agent self-watch (agent's own `inotifywait` on its inbox) → no nudge needed
    - **Priority 2**: `tmux send-keys` — short nudge only (text and Enter sent separately, 0.3s gap)
 
-The nudge is minimal: `inboxN` (e.g. `inbox3` = 3 unread). That's it.
-**Agent reads the inbox file itself.** Message content never travels through tmux — only a short wake-up signal.
+The nudge format: `check_inbox: N unread in queue/inbox/AGENT_ID.yaml` (e.g. `check_inbox: 3 unread in queue/inbox/karo.yaml`). The number N is the **unread count**, NOT an agent number.
+**Agent reads the inbox file specified in the nudge.** Message content never travels through tmux — only a short wake-up signal.
 
 Safety note (shogun):
+
 - If the Shogun pane is active (the Lord is typing), `inbox_watcher.sh` must not inject keystrokes. It should use tmux `display-message` only.
 - Escalation keystrokes (`Escape×2`, context reset, `C-u`) must be suppressed for shogun to avoid clobbering human input.
 
 Special cases (CLI commands sent via `tmux send-keys`):
+
 - `type: clear_command` → sends context reset command via send-keys (Claude Code: `/clear`, Codex: `/new` — auto-converted to /new for Codex)
 - `type: model_switch` → sends the /model command via send-keys
 
@@ -48,7 +52,7 @@ Phase migration is controlled by watcher flags:
 
 - **Phase 1 (baseline)**: `process_unread_once` at startup + `inotifywait` event-driven loop + timeout fallback.
 - **Phase 2 (normal nudge off)**: `disable_normal_nudge` behavior enabled (`ASW_DISABLE_NORMAL_NUDGE=1` or `ASW_PHASE>=2`).
-- **Phase 3 (final escalation only)**: `FINAL_ESCALATION_ONLY=1` (or `ASW_PHASE>=3`) so normal `send-keys inboxN` is suppressed; escalation lane remains for recovery.
+- **Phase 3 (final escalation only)**: `FINAL_ESCALATION_ONLY=1` (or `ASW_PHASE>=3`) so normal `send-keys check_inbox:` is suppressed; escalation lane remains for recovery.
 
 Read-cost controls:
 
@@ -58,24 +62,30 @@ Read-cost controls:
 
 **Escalation** (when nudge is not processed):
 
-| Elapsed | Action | Trigger |
-|---------|--------|---------|
-| 0〜2 min | Standard pty nudge | Normal delivery |
-| 2〜4 min | Escape×2 + nudge | Cursor position bug workaround |
-| 4 min+ | Context reset sent (max once per 5 min, skipped for Codex) | Force session reset + YAML re-read |
+| Elapsed  | Action                                                     | Trigger                            |
+| -------- | ---------------------------------------------------------- | ---------------------------------- |
+| 0〜2 min | Standard pty nudge                                         | Normal delivery                    |
+| 2〜4 min | Escape×2 + nudge                                           | Cursor position bug workaround     |
+| 4 min+   | Context reset sent (max once per 5 min, skipped for Codex) | Force session reset + YAML re-read |
 
 ## Inbox Processing Protocol (karo/ashigaru/gunshi)
 
-When you receive `inboxN` (e.g. `inbox3`):
-1. `Read queue/inbox/{your_id}.yaml`
+When you receive a `check_inbox:` nudge (e.g. `check_inbox: 3 unread in queue/inbox/karo.yaml`):
+
+1. `Read queue/inbox/{your_id}.yaml` — **YOUR file ONLY** (karo→karo.yaml, ashigaru3→ashigaru3.yaml, etc.)
 2. Find all entries with `read: false`
 3. Process each message according to its `type`
 4. Update each processed entry: `read: true` (use Edit tool)
 5. Resume normal workflow
 
+**NEVER read another agent's inbox.** Each agent reads ONLY `queue/inbox/{own_id}.yaml`.
+Karo reads `queue/inbox/karo.yaml` — never `queue/inbox/ashigaru*.yaml` or `queue/inbox/gunshi.yaml`.
+To check subordinate status, read `queue/reports/` or `queue/tasks/` instead.
+
 ### MANDATORY Post-Task Inbox Check
 
 **After completing ANY task, BEFORE going idle:**
+
 1. Read `queue/inbox/{your_id}.yaml`
 2. If any entries have `read: false` → process them
 3. Only then go idle
@@ -96,12 +106,12 @@ Race condition is eliminated: context reset wipes old context. Agent re-reads YA
 
 ## Report Flow (interrupt prevention)
 
-| Direction | Method | Reason |
-|-----------|--------|--------|
-| Ashigaru/Gunshi → Karo | Report YAML + inbox_write | File-based notification |
-| Karo → Shogun/Lord | dashboard.md update only | **inbox to shogun FORBIDDEN** — prevents interrupting Lord's input |
-| Karo → Gunshi | YAML + inbox_write | Strategic task delegation |
-| Top → Down | YAML + inbox_write | Standard wake-up |
+| Direction              | Method                    | Reason                                                             |
+| ---------------------- | ------------------------- | ------------------------------------------------------------------ |
+| Ashigaru/Gunshi → Karo | Report YAML + inbox_write | File-based notification                                            |
+| Karo → Shogun/Lord     | dashboard.md update only  | **inbox to shogun FORBIDDEN** — prevents interrupting Lord's input |
+| Karo → Gunshi          | YAML + inbox_write        | Strategic task delegation                                          |
+| Top → Down             | YAML + inbox_write        | Standard wake-up                                                   |
 
 ## File Operation Rule
 
